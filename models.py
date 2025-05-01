@@ -3,6 +3,70 @@ import torch.nn as nn
 import numpy as np
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+# models.py
+
+import torch.nn as nn
+import torch
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, 3, padding=1),
+            nn.InstanceNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_ch, out_ch, 3, padding=1),
+            nn.InstanceNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.up = nn.ConvTranspose3d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.conv = ConvBlock(in_ch, out_ch)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+class ResUNet3D(nn.Module):
+    def __init__(self, in_channels=4, out_channels=3, base_filters=32):
+        super().__init__()
+        self.enc1 = ConvBlock(in_channels, base_filters)
+        self.enc2 = ConvBlock(base_filters, base_filters * 2)
+        self.enc3 = ConvBlock(base_filters * 2, base_filters * 4)
+        self.bottleneck = ConvBlock(base_filters * 4, base_filters * 8)
+
+        self.pool = nn.MaxPool3d(2)
+
+        self.up2 = UpBlock(base_filters * 8, base_filters * 4)
+        self.up1 = UpBlock(base_filters * 4, base_filters * 2)
+        self.up0 = UpBlock(base_filters * 2, base_filters)
+
+        self.final = nn.Conv3d(base_filters, out_channels, kernel_size=1)
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        b = self.bottleneck(self.pool(e3))
+        d2 = self.up2(b, e3)
+        d1 = self.up1(d2, e2)
+        d0 = self.up0(d1, e1)
+        out = self.final(d0)
+        return self.softmax(out)
+
+
+
+
+# _____________________ classification for CIFAR under here
+
 class ResNet9(nn.Module):
     def __init__(self):
         super(ResNet9, self).__init__()
