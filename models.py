@@ -63,6 +63,66 @@ class ResUNet3D(nn.Module):
         return self.softmax(out)
 
 
+# utils.py  – new version
+class LocalUpdateMONAI(object):
+    """
+    Federated-learning helper that performs `local_ep` epochs of training
+    on a MONAI dict-style DataLoader and returns the updated weights.
+
+    Parameters
+    ----------
+    lr : float
+        Optimiser learning-rate.
+    local_ep : int
+        Number of local epochs.
+    trainloader : torch.utils.data.DataLoader
+        Yields dictionaries with image modalities and a 'seg' key.
+    img_keys : Sequence[str], optional
+        Ordered list of modality keys to concatenate into a 5-D tensor
+        (B, C, D, H, W).  Default corresponds to BraTS.
+    label_key : str, optional
+        Dict key that contains the integer mask.  Default: 'seg'.
+    """
+    def __init__(
+        self,
+        lr: float,
+        local_ep: int,
+        trainloader,
+        img_keys=("flair", "t1", "t1ce", "t2"),
+        label_key="seg",
+    ):
+        self.lr = lr
+        self.local_ep = local_ep
+        self.trainloader = trainloader
+        self.img_keys = img_keys
+        self.label_key = label_key
+
+    @torch.no_grad()
+    def _stack_modalities(self, batch):
+        """Convert dict-batch → (B, C, D, H, W) + (B, D, H, W) mask."""
+        imgs = torch.cat([batch[k] for k in self.img_keys], dim=1)  # C=4
+        mask = batch[self.label_key].squeeze(1)                     # drop ch-dim
+        return imgs.to(device), mask.long().to(device)
+
+    def update_weights(self, model):
+        model.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+        criterion = nn.CrossEntropyLoss().to(device)   # logits vs. class-ids
+
+        epoch_loss = []
+        for _ in range(self.local_ep):
+            batch_loss = []
+            for batch in self.trainloader:             #  MONAI yields dicts
+                images, labels = self._stack_modalities(batch)
+                optimizer.zero_grad()
+                logits = model(images)                 # (B, C, D, H, W)
+                loss = criterion(logits, labels)
+                loss.backward()
+                optimizer.step()
+                batch_loss.append(loss.item())
+            epoch_loss.append(sum(batch_loss) / len(batch_loss))
+
+        return model.state_dict(), sum(epoch_loss) / len(epoch_loss)
 
 
 # _____________________ classification for CIFAR under here
