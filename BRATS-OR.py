@@ -22,7 +22,8 @@ from scipy.special import comb
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 import glob, nibabel as nib, pandas as pd
-from monai.data import CacheDataset, DataLoader
+# from monai.data import CacheDataset, DataLoader
+from monai.data import Dataset as MonaiDataset, DataLoader
 from monai.transforms import (
     LoadImaged, EnsureChannelFirstd, Orientationd, ScaleIntensityd,
     RandFlipd, RandSpatialCropd, Compose, SelectItemsd
@@ -109,7 +110,7 @@ for cid, subj_list in partition_map.items():
         print(f"capping at {cid} for now")
         break
     records = build_records(subj_list)
-    train_datasets[cid] = CacheDataset(data=records, transform=train_tf, cache_rate=0.0)
+    train_datasets[cid] = MonaiDataset(data=records, transform=train_tf)#CacheDataset(data=records, transform=train_tf, cache_rate=0.0)
 
 # Output:
 #   Loading dataset:  10%|██████▌                                                          | 52/511 [00:42<06:16,  1.22it/s]
@@ -118,7 +119,7 @@ for cid, subj_list in partition_map.items():
 # 5.  Build test dataset & dataloader
 # -----------------------------------------------------------
 val_records  = build_val_records(VAL_DIR)
-test_dataset  = CacheDataset(data=val_records, transform=val_tf, cache_rate=1.0)
+test_dataset  = MonaiDataset(data=val_records, transform=val_tf) #, cache_rate=0.0)
 # test_loader   = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=4)
 
 def test_inference(model, test_dataset):
@@ -222,7 +223,14 @@ for epoch in tqdm(range(EPOCHS)):
     print(f'\n | Global Training Round : {epoch+1} |\n')
     global_model.train()
     for idx in idxs_users:
-        trainloader = DataLoader(train_datasets[idx], batch_size=local_bs, shuffle=True)
+        trainloader = DataLoader(
+            train_datasets[idx],
+            batch_size=local_bs,          # or 1–2 for full volumes
+            shuffle=True,
+            num_workers=0,         
+            pin_memory=False
+        )
+
         
         local_model = LocalUpdateMONAI(
             lr=lr,
@@ -238,6 +246,8 @@ for epoch in tqdm(range(EPOCHS)):
     global_weights = average_weights(local_weights, fraction) 
     loss_avg = sum(local_losses) / len(local_losses)
     train_loss.append(loss_avg)
+
+    print(f"[Round {epoch+1:02d}] global loss={loss_avg:.4f}")
 
     gradients = calculate_gradients(local_weights, global_model.state_dict()) 
     for i in range(1, N+1):
