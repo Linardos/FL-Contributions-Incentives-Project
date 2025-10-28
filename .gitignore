@@ -1,4 +1,7 @@
 data*
+pre_trained_*
+archived
 *__pycache__*
 .ipynb_checkpoints/
 submodels/
+brats_segmentation_3d.ipynb

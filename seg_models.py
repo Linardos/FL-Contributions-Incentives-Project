@@ -26,41 +26,30 @@ def preprocess_mask_labels(mask: np.ndarray):
     return mask
 
 class DiceLoss(nn.Module):
-    def __init__(self, eps: float = 1e-9):
-        super(DiceLoss, self).__init__()
-        self.eps = eps
-        
-    def forward(self,
-                logits: torch.Tensor,
-                targets: torch.Tensor) -> torch.Tensor:
-        
-        num = targets.size(0)
-        probability = torch.sigmoid(logits)
-        probability = probability.view(num, -1)
-        targets = targets.view(num, -1)
-        assert(probability.shape == targets.shape)
-        
-        intersection = 2.0 * (probability * targets).sum()
-        union = probability.sum() + targets.sum()
-        dice_score = (intersection + self.eps) / union
-        #print("intersection", intersection, union, dice_score)
-        return 1.0 - dice_score
+    """Soft-Dice for multi-label masks (expects logits)."""
+    def __init__(self, eps: float = 1e-6):
+        super().__init__();  self.eps = eps
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
+        probs = torch.sigmoid(logits)                       # (B,C,D,H,W) ∈ (0,1)
+        dims  = tuple(range(2, probs.ndim))                 # sum over D,H,W
+        inter = 2 * (probs * targets).sum(dim=dims)         # (B,C)
+        union = probs.sum(dim=dims) + targets.sum(dim=dims) + self.eps
+        dice  = inter / union                               # (B,C)
+        return 1 - dice.mean()                              # scalar
+
 
 class BCEDiceLoss(nn.Module):
-    def __init__(self):
-        super(BCEDiceLoss, self).__init__()
-        self.bce = nn.BCEWithLogitsLoss()
+    def __init__(self, dice_w: float = 1.0, bce_w: float = 0.1):
+        super().__init__()
+        self.dice_w = dice_w;  self.bce_w = bce_w
+        self.bce  = nn.BCEWithLogitsLoss()   # raw logits here
         self.dice = DiceLoss()
-        
-    def forward(self, 
-                logits: torch.Tensor,
-                targets: torch.Tensor) -> torch.Tensor:
-        assert(logits.shape == targets.shape)
-        dice_loss = self.dice(logits, targets)
-        bce_loss = self.bce(logits, targets)
-        
-        return bce_loss + dice_loss
-    
+
+    def forward(self, logits, targets):
+        return self.dice_w * self.dice(logits, targets) + \
+               self.bce_w  * self.bce (logits, targets)
+
 
 class ResDoubleConv(nn.Module):
     """ BN -> ReLU -> Conv3D -> BN -> ReLU -> Conv3D """
@@ -233,80 +222,10 @@ class LocalUpdateMONAI(object):
                     # print("logits", logits.shape, "labels", labels.shape)
                     loss = criterion(logits, labels)
                 scaler.scale(loss).backward()         # Scale loss for AMP
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)                # Step optimizer
                 scaler.update()                       # Update scaler
                 batch_loss.append(loss.item())
             epoch_loss.append(sum(batch_loss) / len(batch_loss))
-
-        return model.state_dict(), sum(epoch_loss) / len(epoch_loss)
-
-
-# _____________________ classification for CIFAR under here
-
-class ResNet9(nn.Module):
-    def __init__(self):
-        super(ResNet9, self).__init__()
-        self.prep = self.convbnrelu(channels=3, filters=64)
-        self.layer1 = self.convbnrelu(64, 128)
-        self.layer_pool = nn.MaxPool2d(2, 2, 0, 1, ceil_mode=False)
-        self.layer1r1 = self.convbnrelu(128, 128)
-        self.layer1r2 = self.convbnrelu(128, 128)
-        self.layer2 = self.convbnrelu(128, 256)
-        self.layer3 = self.convbnrelu(256, 512)
-        self.layer3r1 = self.convbnrelu(512, 512)
-        self.layer3r2 = self.convbnrelu(512, 512)
-        self.out_pool = nn.MaxPool2d(kernel_size=4, stride=4, ceil_mode=False)
-        self.flatten = nn.Flatten()
-        self.linear = nn.Linear(in_features=512, out_features=10, bias=False)
-
-    def convbnrelu(self, channels, filters):
-        layers = []
-        layers.append(nn.Conv2d(channels, filters, (3, 3),
-                                (1, 1), (1, 1), bias=False))
-        layers.append(nn.BatchNorm2d(filters, track_running_stats=False))
-        layers.append(nn.ReLU(inplace=True))
-
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        x = self.prep(x)
-        x = self.layer_pool(self.layer1(x))
-        r1 = self.layer1r2(self.layer1r1(x)) 
-        x = x + r1
-        x = self.layer_pool(self.layer2(x))
-        x = self.layer_pool(self.layer3(x))
-        r3 = self.layer3r2(self.layer3r1(x))
-        x = x + r3
-        out = self.out_pool(x)
-        out = self.flatten(out)
-        out = self.linear(out)
-        out = out * 0.125
-
-        return out
-        
-class LocalUpdate(object):
-
-    def __init__(self, lr, local_ep, trainloader):
-        self.lr = lr
-        self.local_ep = local_ep
-        self.trainloader = trainloader
-
-    def update_weights(self, model):
-
-        model.train()
-        epoch_loss = []
-        optimizer = torch.optim.Adam(model.parameters())
-        criterion = nn.CrossEntropyLoss().to(device)
-        for iter in range(self.local_ep):
-            batch_loss = []
-            for batch_idx, (images, labels) in enumerate(self.trainloader):
-                images, labels = images.to(device), labels.to(device)
-                model.zero_grad()   
-                log_probs = model(images)
-                loss = criterion(log_probs, labels)
-                loss.backward()
-                optimizer.step()
-                batch_loss.append(loss.item())
-            epoch_loss.append(sum(batch_loss)/len(batch_loss))
 
         return model.state_dict(), sum(epoch_loss) / len(epoch_loss)
