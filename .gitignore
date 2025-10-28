@@ -5,3 +5,4 @@ archived
 .ipynb_checkpoints/
 submodels/
 brats_segmentation_3d.ipynb
+seg_ckpts/
