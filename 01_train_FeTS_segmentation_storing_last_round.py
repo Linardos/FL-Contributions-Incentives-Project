@@ -29,7 +29,7 @@ import random
 # ─────────────────────────────────────────────────────────────
 from monai.config import print_config
 from monai.utils import set_determinism
-from monai.data import CacheDataset, DataLoader, decollate_batch
+from monai.data import CacheDataset, Dataset, DataLoader, decollate_batch
 from monai.handlers.utils import from_engine
 from monai.losses import DiceLoss
 from monai.metrics import DiceMetric
@@ -206,13 +206,16 @@ for cid, subj_ids in train_partitions.items():
     k = max(1, int(len(subj_ids) * FRAC))   # e.g. 0.3 for 30% subsample
     sample_ids = rng.sample(subj_ids, k)
     train_datasets[cid] = CacheDataset(
-        build_records(sample_ids), transform=train_transform, cache_rate=1
+        build_records(sample_ids), transform=train_transform, cache_rate=0.1
     )
 
 # ── single validation dataset made from *all* val subjects ─
 val_dataset = CacheDataset(
-    build_records(val_subjects), transform=val_transform, cache_rate=1
+    data=build_records(val_subjects),
+    transform=val_transform,
+    cache_rate=0.1
 )
+
 
 print("train per-centre sizes:", {k: len(v) for k, v in train_datasets.items()})
 print("validation size:", len(val_dataset))
@@ -304,9 +307,6 @@ def evaluate_model(model, dataset, device, batch_size=1,
 
     return mean_dice, metric_tc, metric_wt, metric_et
     
-print("Dice before any training:", evaluate_model(global_model, val_dataset, device)) # quick sanity check
-
-
 # ─────────────────────────────────────────────────────────────
 #  Federation setup
 # ─────────────────────────────────────────────────────────────
@@ -316,7 +316,7 @@ N = len(idxs_users)
 print(f"We got {N} clients")
 
 # Fed hyperparams (align with your working pipeline)
-ROUNDS       = 50            # you can raise later (e.g., 100)
+ROUNDS       = 100            # you can raise later (e.g., 100)
 LOCAL_EPOCHS = 1
 LR           = 1e-4
 BATCH        = 1
