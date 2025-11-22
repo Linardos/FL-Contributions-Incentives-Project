@@ -18,6 +18,7 @@ Usage from a notebook (after rebuilding datasets/model):
     )
 """
 
+import os
 import copy
 import time
 from itertools import combinations
@@ -89,8 +90,8 @@ def run_shapley_eval(
     fractions: List[float],
     submodel_file_template: str,
     device: torch.device,
-    coalition_csv: str = "coalition_utilities.csv",
-    allocation_csv: str = "allocation_summary.csv",
+    coalition_csv: str = "./logs/coalition_utilities.csv",
+    allocation_csv: str = "./logs/allocation_summary.csv",
 ):
     """
     Post-hoc evaluation of all coalitions using saved client submodels.
@@ -171,10 +172,30 @@ def run_shapley_eval(
     accuracy_dict: Dict[Tuple[int, ...], float] = {}
     coalition_rows = []
 
+    # ── resume from existing coalition CSV if it exists ─────────────────────
+    done_coalitions = set()
+    if os.path.exists(coalition_csv):
+        prev_df = pd.read_csv(coalition_csv)
+        for _, row in prev_df.iterrows():
+            # parse coalition string "1,2,3" → (1, 2, 3)
+            coalition_tuple = tuple(int(x) for x in str(row["coalition"]).split(",") if x != "")
+            done_coalitions.add(coalition_tuple)
+            # store the mean dice in accuracy_dict
+            accuracy_dict[coalition_tuple] = float(row["val_mean_dice"])
+            coalition_rows.append(row.to_dict())
+
+        print(f"[Resume] Loaded {len(done_coalitions)} coalitions from {coalition_csv}")
+
     start_all = time.time()
 
     # ── evaluate every proper coalition (exclude grand coalition at first) ──
-    for subset in powerset[:-1]:
+    save_every = 1
+    for i, subset in enumerate(powerset[:-1], start=1):
+        # skip coalitions already computed in a previous run
+        if subset in done_coalitions:
+            print(f"Skipping coalition {subset} (already evaluated).")
+            continue
+
         if len(subset) == 1:
             subset_sd = torch.load(submodel_file_template.format(subset[0]),
                                    map_location="cpu")
@@ -208,12 +229,21 @@ def run_shapley_eval(
             f"TC={metric_tc:.4f} | WT={metric_wt:.4f} | ET={metric_et:.4f}"
         )
 
+        # incremental checkpointing
+        if i % save_every == 0:
+            tmp_path = coalition_csv + ".tmp"
+            coalition_df = pd.DataFrame(coalition_rows)
+            coalition_df.to_csv(tmp_path, index=False)
+            os.replace(tmp_path, coalition_csv)  # atomic-ish on POSIX/NTFS
+            print(f"[Checkpoint] Saved {len(coalition_rows)} coalition rows → {coalition_csv}")
+
         del submodel
         torch.cuda.empty_cache()
 
     # ── ensure grand coalition utility ──────────────────────────────────────
     grand = tuple(clients)
     if grand not in accuracy_dict:
+        print("Evaluating grand coalition...")
         mean_dice, metric_tc, metric_wt, metric_et = evaluate_model(
             global_model.to(device), val_dataset, device
         )
@@ -226,6 +256,8 @@ def run_shapley_eval(
             "val_wt": metric_wt,
             "val_et": metric_et,
         })
+    else:
+        print("Grand coalition already present in cache.")
 
     # add empty coalition utility
     accuracy_dict[()] = 0.0

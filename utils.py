@@ -144,9 +144,9 @@ def shapley(utility, N):
     for key in utility:
         if key != ():
             for contributor in key:
-                # print('contributor:', contributor, key) # print check
+                print('contributor:', contributor, key) # print check
                 marginal_contribution = utility[key] - utility[tuple(i for i in key if i!=contributor)]
-                # print('marginal:', marginal_contribution) # print check
+                print('marginal:', marginal_contribution) # print check
                 shapley_dict[contributor] += marginal_contribution /((comb(N-1,len(key)-1))*N)
 
     return shapley_dict

@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────
-#  Must have run script #01. Assure your training hyperparams match though.
+#  Imports (minimal for post-hoc Shapley eval)
 # ─────────────────────────────────────────────────────────────
 import os
 import random
@@ -169,6 +169,7 @@ global_model.load_state_dict(torch.load(best_model_path, map_location=device))
 global_model.eval()
 
 print("Loaded best global model from:", best_model_path)
+
 
 from shapley_eval import run_shapley_eval
 
