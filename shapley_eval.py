@@ -82,8 +82,7 @@ def stats(vector: np.ndarray, label: str = ""):
     msg += f"Budget (sum):      {vector.sum():.4f}\n"
     print(msg)
 
-
-def run_shapley_eval(
+def compute_coalition_utilities(
     global_model,
     val_dataset,
     idxs_users: List[int],
@@ -91,10 +90,11 @@ def run_shapley_eval(
     submodel_file_template: str,
     device: torch.device,
     coalition_csv: str = "./logs/coalition_utilities.csv",
-    allocation_csv: str = "./logs/allocation_summary.csv",
+    save_every: int = 1,
 ):
     """
-    Post-hoc evaluation of all coalitions using saved client submodels.
+    Evaluate all coalitions (post-hoc) and save their utilities to CSV.
+    This is the expensive, resumable part.
 
     Parameters
     ----------
@@ -112,20 +112,19 @@ def run_shapley_eval(
         Device for evaluation.
     coalition_csv : str
         Path to save coalition utilities CSV.
-    allocation_csv : str
-        Path to save Shapley + LC allocations CSV.
+    save_every : int
+        How often (in number of newly evaluated coalitions) to checkpoint to CSV.
 
     Returns
     -------
     accuracy_dict : dict[tuple[int], float]
-    shapley_dict  : dict[int, float]
-    lc_dict       : pulp LpProblem
+        Mapping from coalition (tuple of client IDs) to mean validation Dice.
     """
+
     from monai.data import DataLoader
     from monai.metrics import DiceMetric
     from monai.inferers import sliding_window_inference
 
-    # ----- helper evaluator (uses passed-in model, not any global) ----------
     dice_metric = DiceMetric(include_background=True, reduction="mean")
     dice_metric_batch = DiceMetric(include_background=True, reduction="mean_batch")
 
@@ -177,21 +176,19 @@ def run_shapley_eval(
     if os.path.exists(coalition_csv):
         prev_df = pd.read_csv(coalition_csv)
         for _, row in prev_df.iterrows():
-            # parse coalition string "1,2,3" → (1, 2, 3)
-            coalition_tuple = tuple(int(x) for x in str(row["coalition"]).split(",") if x != "")
+            coalition_tuple = tuple(
+                int(x) for x in str(row["coalition"]).split(",") if x != ""
+            )
             done_coalitions.add(coalition_tuple)
-            # store the mean dice in accuracy_dict
             accuracy_dict[coalition_tuple] = float(row["val_mean_dice"])
             coalition_rows.append(row.to_dict())
-
         print(f"[Resume] Loaded {len(done_coalitions)} coalitions from {coalition_csv}")
 
     start_all = time.time()
+    newly_evaluated = 0
 
     # ── evaluate every proper coalition (exclude grand coalition at first) ──
-    save_every = 1
-    for i, subset in enumerate(powerset[:-1], start=1):
-        # skip coalitions already computed in a previous run
+    for subset in powerset[:-1]:
         if subset in done_coalitions:
             print(f"Skipping coalition {subset} (already evaluated).")
             continue
@@ -229,12 +226,12 @@ def run_shapley_eval(
             f"TC={metric_tc:.4f} | WT={metric_wt:.4f} | ET={metric_et:.4f}"
         )
 
-        # incremental checkpointing
-        if i % save_every == 0:
+        newly_evaluated += 1
+        if save_every > 0 and newly_evaluated % save_every == 0:
             tmp_path = coalition_csv + ".tmp"
             coalition_df = pd.DataFrame(coalition_rows)
             coalition_df.to_csv(tmp_path, index=False)
-            os.replace(tmp_path, coalition_csv)  # atomic-ish on POSIX/NTFS
+            os.replace(tmp_path, coalition_csv)
             print(f"[Checkpoint] Saved {len(coalition_rows)} coalition rows → {coalition_csv}")
 
         del submodel
@@ -259,24 +256,86 @@ def run_shapley_eval(
     else:
         print("Grand coalition already present in cache.")
 
-    # add empty coalition utility
+    total_val_time = time.time() - start_all
+    print(f" Total coalition eval time: {total_val_time:0.4f}s")
+    print(f" Grand-coalition validation utility (Dice): {accuracy_dict[grand]:.4f}")
+
+    # final save
+    coalition_df = pd.DataFrame(coalition_rows)
+    coalition_df.to_csv(coalition_csv, index=False)
+    print(f"\n[Saved] Coalition utilities → {coalition_csv}")
+
+    # add empty coalition utility here as well
     accuracy_dict[()] = 0.0
+
+    return accuracy_dict
+
+def run_shapley_from_coalitions(
+    coalition_csv: str = "./logs/coalition_utilities.csv",
+    allocation_csv: str = "./logs/allocation_summary.csv",
+):
+    """
+    Load coalition utilities from CSV, reconstruct accuracy_dict,
+    then compute Shapley and Least Core allocations.
+
+    Parameters
+    ----------
+    coalition_csv : str
+        Path to coalition utilities CSV (as written by compute_coalition_utilities).
+    allocation_csv : str
+        Path to save Shapley + LC allocations CSV.
+
+    Returns
+    -------
+    accuracy_dict : dict[tuple[int], float]
+    shapley_dict  : dict[int, float]
+    lc_dict       : pulp LpProblem
+    """
+    if not os.path.exists(coalition_csv):
+        raise FileNotFoundError(f"{coalition_csv} not found.")
+
+    coalition_df = pd.read_csv(coalition_csv)
+
+    # reconstruct accuracy_dict from CSV
+    accuracy_dict: Dict[Tuple[int, ...], float] = {}
+    all_clients = set()
+
+    for _, row in coalition_df.iterrows():
+        coalition_str = str(row["coalition"])
+        if coalition_str.strip() == "":
+            continue
+        coalition = tuple(int(x) for x in coalition_str.split(","))
+        all_clients.update(coalition)
+        accuracy_dict[coalition] = float(row["val_mean_dice"])
+
+    # infer number of clients from CSV
+    clients = sorted(all_clients)
+    n_clients = len(clients)
+
+    # add empty coalition if missing
+    if () not in accuracy_dict:
+        accuracy_dict[()] = 0.0
+
+    # sanity: ensure grand coalition present
+    grand = tuple(clients)
+    if grand not in accuracy_dict:
+        raise ValueError(
+            f"Grand coalition {grand} not found in {coalition_csv}. "
+            "Did you run compute_coalition_utilities() to completion?"
+        )
 
     # ── Shapley & Least Core ────────────────────────────────────────
     shap_start = time.time()
-    shapley_dict = shapley(accuracy_dict, len(clients))
+    shapley_dict = shapley(accuracy_dict, n_clients)
     shapTime = time.time() - shap_start
 
     lc_start = time.time()
-    lc_dict = least_core(accuracy_dict, len(clients))
+    lc_dict = least_core(accuracy_dict, n_clients)
     LCTime = time.time() - lc_start
-
-    total_val_time = time.time() - start_all
 
     print(f"\n Grand-coalition validation utility (Dice): {accuracy_dict[grand]:.4f}")
     print(f" Total Time Shapley (post-hoc only): {shapTime:0.4f}s")
     print(f" Total Time LC (post-hoc only):      {LCTime:0.4f}s")
-    print(f" Total coalition eval time:          {total_val_time:0.4f}s")
 
     # ── print allocations ───────────────────────────────────────────
     print("\nShapley allocation:")
@@ -293,13 +352,7 @@ def run_shapley_eval(
     e_slack = lc_dict.variablesDict()['e'].value()
     print(f" e (slack): {e_slack:.4f}")
 
-    # ── store stats and CSVs ────────────────────────────────────────
-    # coalition utilities
-    coalition_df = pd.DataFrame(coalition_rows)
-    coalition_df.to_csv(coalition_csv, index=False)
-    print(f"\n[Saved] Coalition utilities → {coalition_csv}")
-
-    # allocation summary
+    # ── allocation summary CSV ──────────────────────────────────────
     clients_sorted = sorted(shapley_dict.keys())
     alloc_rows = []
     for cid in clients_sorted:
@@ -314,8 +367,10 @@ def run_shapley_eval(
 
     # simple fairness stats
     shap_vec = np.array([shapley_dict[cid] for cid in clients_sorted], dtype=float)
-    lc_vec = np.array([alloc_df.loc[alloc_df.client == cid, "least_core"].item()
-                       for cid in clients_sorted], dtype=float)
+    lc_vec = np.array([
+        alloc_df.loc[alloc_df.client == cid, "least_core"].item()
+        for cid in clients_sorted
+    ], dtype=float)
 
     stats(shap_vec, label="Shapley")
     stats(lc_vec, label="Least-Core")
