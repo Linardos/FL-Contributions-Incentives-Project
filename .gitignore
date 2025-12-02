@@ -4,5 +4,6 @@ archived
 *__pycache__*
 .ipynb_checkpoints/
 submodels*/
+ISO/
 brats_segmentation_3d.ipynb
 seg_ckpts/
