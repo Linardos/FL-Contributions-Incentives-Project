@@ -275,8 +275,9 @@ def run_shapley_from_coalitions(
     allocation_csv: str = "./logs/allocation_summary.csv",
 ):
     """
-    Load coalition utilities from CSV, reconstruct accuracy_dict,
-    then compute Shapley and Least Core allocations.
+    Load coalition utilities from CSV, reconstruct accuracy_dict (with original
+    client labels), then compute Shapley and Least Core allocations by internally
+    remapping client IDs to 1..N for the cooperative-game routines. <-- !!! reason for this is because Vasilis' code expects 1 to N.
 
     Parameters
     ----------
@@ -288,15 +289,18 @@ def run_shapley_from_coalitions(
     Returns
     -------
     accuracy_dict : dict[tuple[int], float]
+        Coalition utilities keyed by ORIGINAL client IDs.
     shapley_dict  : dict[int, float]
+        Shapley values keyed by ORIGINAL client IDs.
     lc_dict       : pulp LpProblem
+        Least-core optimization problem (still indexed internally by 1..N).
     """
     if not os.path.exists(coalition_csv):
         raise FileNotFoundError(f"{coalition_csv} not found.")
 
     coalition_df = pd.read_csv(coalition_csv)
 
-    # reconstruct accuracy_dict from CSV
+    # ── reconstruct accuracy_dict with ORIGINAL labels ──────────────────────
     accuracy_dict: Dict[Tuple[int, ...], float] = {}
     all_clients = set()
 
@@ -309,7 +313,7 @@ def run_shapley_from_coalitions(
         accuracy_dict[coalition] = float(row["val_mean_dice"])
 
     # infer number of clients from CSV
-    clients = sorted(all_clients)
+    clients = sorted(all_clients)      # e.g., [1, 4, 6, 13, 18, 21]
     n_clients = len(clients)
 
     # add empty coalition if missing
@@ -324,35 +328,54 @@ def run_shapley_from_coalitions(
             "Did you run compute_coalition_utilities() to completion?"
         )
 
-    # ── Shapley & Least Core ────────────────────────────────────────
+    # ── build label↔index maps for 1..N reindexing ─────────────────────────
+    # internal index: 1..N
+    label_to_idx = {cid: i + 1 for i, cid in enumerate(clients)}
+    idx_to_label = {i + 1: cid for i, cid in enumerate(clients)}
+
+    # remap coalitions in accuracy_dict to 1..N for shapley/LC routines
+    utility_idx: Dict[Tuple[int, ...], float] = {}
+    for coal, val in accuracy_dict.items():
+        # coal is a tuple of ORIGINAL labels; map to contiguous indices
+        coal_idx = tuple(label_to_idx[c] for c in coal)
+        utility_idx[coal_idx] = val
+
+    # ── Shapley & Least Core on reindexed game ──────────────────────────────
     shap_start = time.time()
-    shapley_dict = shapley(accuracy_dict, n_clients)
+    shapley_idx = shapley(utility_idx, n_clients)   # keys are 1..N
     shapTime = time.time() - shap_start
 
     lc_start = time.time()
-    lc_dict = least_core(accuracy_dict, n_clients)
+    lc_dict = least_core(utility_idx, n_clients)    # also expects 1..N labels
     LCTime = time.time() - lc_start
+
+    # map Shapley values back to ORIGINAL client IDs
+    shapley_dict: Dict[int, float] = {
+        idx_to_label[idx]: phi for idx, phi in shapley_idx.items()
+    }
 
     print(f"\n Grand-coalition validation utility (Dice): {accuracy_dict[grand]:.4f}")
     print(f" Total Time Shapley (post-hoc only): {shapTime:0.4f}s")
     print(f" Total Time LC (post-hoc only):      {LCTime:0.4f}s")
 
-    # ── print allocations ───────────────────────────────────────────
+    # ── print allocations (in terms of ORIGINAL client IDs) ─────────────────
     print("\nShapley allocation:")
-    for cid, phi in shapley_dict.items():
-        print(f" client {cid}: {phi:.4f}")
+    for cid in sorted(shapley_dict.keys()):
+        print(f" client {cid}: {shapley_dict[cid]:.4f}")
 
     print("\nLeast-Core allocation:")
-    lc_values = {}
+    lc_values: Dict[int, float] = {}
     for var in lc_dict.variables():
         if var.name.startswith("x("):
-            cid = int(var.name[2:-1])
+            # this 'cid_idx' is 1..N; map back to ORIGINAL label
+            cid_idx = int(var.name[2:-1])
+            cid = idx_to_label[cid_idx]
             lc_values[cid] = var.value()
             print(f" client {cid}: {var.value():.4f}")
     e_slack = lc_dict.variablesDict()['e'].value()
     print(f" e (slack): {e_slack:.4f}")
 
-    # ── allocation summary CSV ──────────────────────────────────────
+    # ── allocation summary CSV (ORIGINAL IDs) ───────────────────────────────
     clients_sorted = sorted(shapley_dict.keys())
     alloc_rows = []
     for cid in clients_sorted:
