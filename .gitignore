@@ -3,7 +3,7 @@ pre_trained_*
 archived
 *__pycache__*
 .ipynb_checkpoints/
-submodels*/
+*submodels*/
 ISO/
 brats_segmentation_3d.ipynb
 seg_ckpts/
