@@ -1,16 +1,9 @@
 import torch
-import torch.nn as nn
 import numpy as np
 import pulp
 import copy
-import time
 from sklearn.model_selection import StratifiedShuffleSplit
-import torchvision
-import torchvision.transforms as transforms
-from torch.utils.data import Dataset, DataLoader, TensorDataset
-from torch.utils.data.sampler import SubsetRandomSampler
 from itertools import chain, combinations
-from tqdm import tqdm
 from scipy.special import comb
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -75,11 +68,21 @@ def average_weights(w, fraction):  # this can also be used to average gradients
     :param fraction: list of fraction of data from the users
     :Returns the weighted average of the weights.
     """
-    w_avg = copy.deepcopy(w[0]) #copy the weights from the first user in the list 
+    w_avg = copy.deepcopy(w[0]) #copy the weights from the first user in the list
+    frac_sum = float(sum(fraction))
+    if frac_sum <= 0:
+        norm_fraction = [1.0 / len(w) for _ in w]
+    else:
+        norm_fraction = [float(f) / frac_sum for f in fraction]
+
     for key in w_avg.keys():
-        w_avg[key] *= torch.tensor(fraction[0]/sum(fraction), dtype=w_avg[key].dtype)
-        for i in range(1, len(w)):
-            w_avg[key] += w[i][key] * torch.tensor(fraction[0]/sum(fraction), dtype=w_avg[key].dtype)
+        if torch.is_floating_point(w_avg[key]) or torch.is_complex(w_avg[key]):
+            w_avg[key] = w[0][key] * torch.tensor(norm_fraction[0], dtype=w_avg[key].dtype)
+            for i in range(1, len(w)):
+                w_avg[key] += w[i][key] * torch.tensor(norm_fraction[i], dtype=w_avg[key].dtype)
+        else:
+            # Keep integer/buffer tensors deterministic.
+            w_avg[key] = copy.deepcopy(w[0][key])
 
     return w_avg
 
@@ -144,9 +147,7 @@ def shapley(utility, N):
     for key in utility:
         if key != ():
             for contributor in key:
-                print('contributor:', contributor, key) # print check
                 marginal_contribution = utility[key] - utility[tuple(i for i in key if i!=contributor)]
-                print('marginal:', marginal_contribution) # print check
                 shapley_dict[contributor] += marginal_contribution /((comb(N-1,len(key)-1))*N)
 
     return shapley_dict

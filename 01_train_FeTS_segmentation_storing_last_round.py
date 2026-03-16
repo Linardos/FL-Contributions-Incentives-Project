@@ -4,6 +4,7 @@
 import os
 import copy
 import time
+import json
 import glob
 import shutil
 import tempfile
@@ -333,6 +334,15 @@ submodel_file_template = os.path.join(submodel_dir, "submodel_{}.pth")
 global_model_path      = os.path.join(submodel_dir, "global_model.pth")
 best_model_path        = os.path.join(submodel_dir, "best_metric_model.pth")
 
+# Optional artifacts to support OR/MR trajectory-based contribution evaluation.
+# Files written:
+#   round_XXXX_global_start.pth
+#   round_XXXX_client_<cid>.pth
+SAVE_ROUND_ARTIFACTS = True
+round_artifacts_dir = os.path.join(submodel_dir, "round_artifacts")
+if SAVE_ROUND_ARTIFACTS:
+    os.makedirs(round_artifacts_dir, exist_ok=True)
+
 # Save initial global (round 0) – useful for baselines
 torch.save(global_model.state_dict(), global_model_path)
 
@@ -419,6 +429,13 @@ last_round_run = 0     # track actual last round (for logging)
 
 for rnd in trange(1, ROUNDS + 1, desc="Global rounds", position=0, leave=True, dynamic_ncols=True):
     local_weights, client_losses = [], []
+    last_round_run = rnd
+
+    if SAVE_ROUND_ARTIFACTS:
+        torch.save(
+            global_model.state_dict(),
+            os.path.join(round_artifacts_dir, f"round_{rnd:04d}_global_start.pth"),
+        )
 
     # —— local updates per client ——
     for cid in tqdm(idxs_users, desc=" clients", position=1, leave=False, total=len(idxs_users), dynamic_ncols=True):
@@ -431,6 +448,11 @@ for rnd in trange(1, ROUNDS + 1, desc="Global rounds", position=0, leave=True, d
 
         # Persist this client's *latest* local model for Shapley / ablations
         torch.save(w, submodel_file_template.format(cid))
+        if SAVE_ROUND_ARTIFACTS:
+            torch.save(
+                w,
+                os.path.join(round_artifacts_dir, f"round_{rnd:04d}_client_{cid}.pth"),
+            )
 
     # —— FedAvg (fraction-weighted) ——
     global_model.load_state_dict(average_weights(local_weights, fractions))
@@ -475,6 +497,18 @@ print(f"|---- Val Dice(mean): {val_mean_dice:.4f} | TC {val_tc:.4f} | WT {val_wt
 # Store utility for coalition = all clients (tuple keeps order deterministic)
 accuracy_dict[tuple(idxs_users)] = val_mean_dice
 
+if SAVE_ROUND_ARTIFACTS:
+    metadata = {
+        "rounds_completed": int(last_round_run),
+        "clients": [int(cid) for cid in idxs_users],
+        "fractions": [float(f) for f in fractions],
+        "global_model_path": global_model_path,
+        "best_model_path": best_model_path,
+    }
+    with open(os.path.join(round_artifacts_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Saved round-artifact metadata -> {os.path.join(round_artifacts_dir, 'metadata.json')}")
+
 
 # below is the shapley calculation. In case training finishes and you're sleeping, it can move on with the next step. If it crashes but previous steps are complete, continue using script #02
 
@@ -489,5 +523,10 @@ accuracy_dict, shapley_dict, lc_dict = run_shapley_eval(
     device=device,
     coalition_csv="coalition_utilities.csv",
     allocation_csv="allocation_summary.csv",
+    method="or",
+    round_artifacts_dir=round_artifacts_dir if SAVE_ROUND_ARTIFACTS else None,
+    max_samples=64,
+    save_every=25,
+    progress=True,
+    show_batch_progress=False,
 )
-
